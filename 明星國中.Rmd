@@ -1,0 +1,236 @@
+---
+title: "明星國中"
+author: "Simon"
+date: "2023-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r}
+library(tidyverse)
+library(RSelenium)
+library(doParallel)
+library(foreach)
+library(stringr)
+```
+
+```{r}
+#定義notin operator
+`%notin%` <- Negate(`%in%`)
+
+#距離函數
+distance <- function(a1, a2, b1, b2){
+  d <- sqrt((a1 - b1) ^ 2 + (a2 - b2) ^ 2)
+  return(d)
+}
+
+#虛擬變數
+dummies <- function(data){
+  dummy <- factor(data)
+  my_dummies <- model.matrix(~ dummy - 1) %>% as.data.frame()
+  return(my_dummies)
+}
+```
+
+```{r}
+data <- read.csv("taipei_city_preowned_data.csv")
+```
+
+邊界點經緯度，透過google map查詢
+1.25.061593303895293, 121.56127336020461
+2.25.056727456072768, 121.56175181551124
+3.25.056573979795367, 121.56020221073425
+4.25.054015868292794, 121.56048188776732
+5.25.053615392337566, 121.55661151850144
+6.25.05156395413001, 121.55732424384402
+7.25.051488741042142, 121.55787236602306
+8.25.045131991221194, 121.55771143348224
+9.25.044393264956017, 121.55391342551722
+10.25.045079938902237, 121.54605404314047
+11.25.04486712160197, 121.54385045861105
+12.25.054580427818788, 121.54409166815695
+13.25.054482352647394, 121.54614864762692
+14.25.05780051902309, 121.54896346163851
+15.25.061445494875564, 121.55080391695402
+
+經緯度轉換網址：https://wdms.epa.gov.tw/idms/coordtrans.htm
+
+```{r}
+#邊界點二度分帶座標
+boundary_corner <- data.frame(bp1 = c(306627.2386, 2772717.2903),
+                             bp2 = c(306677.7495, 2772178.5196),
+                             bp3 = c(306521.4699, 2772160.8713),
+                             bp4 = c(306550.8623, 2771877.6363),
+                             bp5 = c(306160.5287, 2771831.6650),
+                             bp6 = c(306233.3781, 2771604.7315),
+                             bp7 = c(306288.7185, 2771596.6284),
+                             bp8 = c(306275.3821, 2770892.4502),
+                             bp9 = c(305892.4746, 2770809.0507),
+                             bp10 = c(305099.1034, 2770881.8879),
+                             bp11 = c(304876.8430, 2770857.4198),
+                             bp12 = c(304896.8565, 2771933.4195),
+                             bp13 = c(305104.4461, 2771923.3923),
+                             bp14 = c(305386.9650, 2772292.0815),
+                             bp15 = c(305571.0151, 2772696.5757))
+
+#邊界座標，以1公尺做區分
+boundary_point <- NULL
+
+for (i in 2: length(boundary_corner)){
+  #兩點座標
+  a1 <- boundary_corner[1, i - 1]
+  a2 <- boundary_corner[2, i - 1]
+  b1 <- boundary_corner[1, i]
+  b2 <- boundary_corner[2, i]
+  
+  #每公尺分段
+  dd <- distance(a1, a2, b1, b2)
+  
+  x <- seq(a1, b1, length.out = round(dd, 0))
+  y <- seq(a2, b2, length.out = round(dd, 0))
+  
+  #合併欄位
+  boundary_point <- rbind(boundary_point, data.frame(x, y))
+}
+```
+
+```{r}
+#欲使用的欄位
+select_character <- c("h_price_m2", "parking_price",
+                      "trans_y", "trans_m", "date_complete", "county", "town", "address", "trans_landsize", 
+                      "trans_story", "story", "trans_num", "building_type", "trans_size", 
+                      "manage", "parking_size", "type", "usage_type", "usage", "landtotarea",
+                      "longitude", "latitude", "note")
+
+
+#房屋使用形式，只取住宅
+usage_live_index <- unique(grep("[住]",data$usage, value = TRUE))
+building_type_live_index <- c("套房(1房1廳1衛)", "透天厝", "公寓(5樓含以下無電梯)", "華廈(10層含以下有電梯)", "住宅大樓(11層含以上有電梯)")
+
+#去除純土地、車位資料，篩選出住宅
+#只選松山區、信義區、中山區、大安區
+taipei_city_preowned_data <- data[grep("[建房]", data$type), ] %>% .[, -1:-2] %>%
+  filter(usage %in% usage_live_index, building_type %in% building_type_live_index) %>%
+  filter(town %in% c("松山區", "中山區", "信義區",　"大安區")) %>%
+  select(all_of(select_character))
+```
+
+```{r}
+#計算房屋與邊界點的距離
+#開啟平行運算環境
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+# 計算距離並找到最小距離
+distance_to_boundary <- foreach(i = 1: nrow(taipei_city_preowned_data), .combine = rbind) %dopar% {
+  min_dd <- 10 ^ 10
+  result <- numeric(3)
+  
+  for (j in 1: nrow(boundary_point)) {
+    a1 <- taipei_city_preowned_data$longitude[i]
+    a2 <- taipei_city_preowned_data$latitude[i]
+    b1 <- boundary_point$x[j]
+    b2 <- boundary_point$y[j]
+    dd <- distance(a1, a2, b1, b2)
+    
+    if (dd < min_dd) {
+      min_dd <- dd
+      result <- c(min_dd, b1, b2)
+    }
+  }
+  result
+}
+
+# 將結果轉換為data.frame
+colnames(distance_to_boundary) <- c("distance_to_boundary", "x", "y")
+distance_to_boundary <- data.frame(distance_to_boundary)
+
+# 停止平行運算環境
+stopCluster(cl)
+
+#合併欄位，並選取松山區所有資料，以及中山區、大安區、信義區距離邊界1000公尺內的資料
+taipei_city_preowned_data <- cbind(taipei_city_preowned_data, distance_to_boundary) %>%
+  filter(town == "松山區" | (town != "松山區" & distance_to_boundary <= 1000))
+```
+
+
+```{r}
+#抓取地址的鄰里
+#創建鄰里欄位
+taipei_city_preowned_data <- taipei_city_preowned_data %>%
+  mutate(address_1 = paste0(county, town, address),
+         neighborhood = "",
+         vil = "")
+
+#鄰里的xpath
+xpath_neighborhood <- c("/html/body/div[2]/div/div/div/div[5]/table/tbody/tr[7]/td[2]")
+xpath_vil <- c("/html/body/div[2]/div/div/div/div[5]/table/tbody/tr[8]/td[2]")
+```
+
+
+搜尋網址："https://twzipcode.com/"
+```{r eval=FALSE}
+#啟動瀏覽器
+remDr <- remoteDriver(browserName = "chrome")
+remDr$open()
+Sys.sleep(2)
+
+#鄰里查詢
+for (i in 1: nrow(taipei_city_preowned_data)) {
+  #郵遞區號搜尋頁面
+  remDr$navigate("https://twzipcode.com/")
+  #暫緩
+  Sys.sleep(0.8)
+  
+  #輸入地址並搜尋
+  search_box <- remDr$findElement(using = "id", "Search_C_T") $sendKeysToElement(list(taipei_city_preowned_data$address_1[i], key = "enter"))
+  Sys.sleep(0.8)
+  
+  #因部分地址無法查詢，故跳過
+  tryCatch({
+    #抓取頁面的鄰里資料
+    taipei_city_preowned_data$neighborhood[i] <- remDr$findElement(using = "xpath", xpath_neighborhood) $getElementText() %>% unlist()
+    taipei_city_preowned_data$vil[i] <- remDr$findElement(using = "xpath", xpath_vil) $getElementText() %>% unlist()
+    
+    #暫緩
+    Sys.sleep(0.3)
+  }, error = function(e){
+    message("異常", e$message)
+  })
+}
+```
+
+介壽國中學區
+1.介壽、東榮、東昌、東勢、龍田、精忠。 
+2.復勢：中崙、介壽共同學區 
+3.中華（20、23-25鄰）：介壽、敦化共同學區。 
+
+敦化國中學區
+1.中華（1-19、21、22鄰）、中正、中崙、吉仁、美仁、福成、敦化、復源、松基（13、15-16鄰）。 
+2.復建：中崙、敦化共同學區。 
+3.中華（20、23-25鄰）：介壽、敦化共同學區。
+
+```{r}
+#在敦化、介壽學區的里
+school_dist_vil <- c("介壽里", "東榮里", "東昌里", "東勢里", "龍田里", "精忠里", "復勢里", "中華里", "中正里", "中崙里", "吉仁里", "美仁里", "福成里", "敦化里", "復源里")
+songkee_vil_neighorhood <- c("13鄰", "15鄰", "16鄰") 
+
+#建立學區虛擬變數，在學區內為1，其他為0
+taipei_city_preowned_data[is.na(taipei_city_preowned_data)] <- ""
+
+taipei_city_preowned_data <- taipei_city_preowned_data %>%
+  filter(vil != "") %>%
+  mutate(school_dist_dummy = ifelse(vil %in% school_dist_vil, 1,                                         #若在學區的里設為1
+                             ifelse(vil == "松基里" &  neighborhood %in% songkee_vil_neighorhood, 1, 0)))#若在松基里13,15,16鄰設為1
+
+#存成CSV檔
+write.csv(taipei_city_preowned_data, "preowned_data.csv")
+```
+
